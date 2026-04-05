@@ -1,0 +1,37 @@
+# ==========================================
+#  Iris systemd 服务文件
+#
+#  默认部署路径: /opt/iris
+#  默认运行用户: iris
+#  默认数据目录: /opt/iris/.iris
+#
+#  使用方法：
+#  1. 复制到 /etc/systemd/system/iris.service
+#  2. 根据实际情况修改 WorkingDirectory、ExecStart、User、IRIS_DATA_DIR
+#  3. systemctl daemon-reload
+#  4. systemctl enable --now iris
+# ==========================================
+
+[Unit]
+Description=Iris AI Chat Service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/iris
+ExecStart=/opt/iris/bin/iris serve
+User=iris
+Group=iris
+Environment=NODE_ENV=production
+Environment=IRIS_DATA_DIR=/opt/iris/.iris
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/iris/.iris
+
+[Install]
+WantedBy=multi-user.target

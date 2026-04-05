@@ -1,0 +1,58 @@
+{
+  "name": "iris",
+  "version": "1.0.3",
+  "description": "模块化、可解耦的 AI 聊天框架，支持多平台、多 LLM、工具调用",
+  "license": "GPL-3.0-only",
+  "type": "module",
+  "scripts": {
+    "build": "npm run typecheck:ui && npm run build:ui && npx tsc -p tsconfig.build.json",
+    "build:extension-sdk": "npm --prefix packages/extension-sdk run build",
+    "sync:extensions": "tsx script/sync-extension-metadata.ts",
+    "build:compile": "npm run sync:extensions && npm install --no-save react-devtools-core && tsx script/install-extension-deps.ts --embedded-only --frozen-lockfile && bun run script/build.ts",
+    "build:ui": "cd extensions/web/web-ui && npm run build",
+    "typecheck:ui": "cd extensions/web/web-ui && npm run typecheck",
+    "lint:ui": "cd extensions/web/web-ui && npm run lint",
+    "check:ui": "cd extensions/web/web-ui && npm run check",
+    "dev:ui": "cd extensions/web/web-ui && npm run dev",
+    "start": "tsx script/run.ts",
+    "dev": "tsx script/run.ts",
+    "cli": "tsx src/cli.ts",
+    "cli:bun": "bun src/cli.ts",
+    "start:bun": "bun script/run.ts",
+    "dev:bun": "bun script/run.ts",
+    "setup:extensions": "tsx script/install-extension-deps.ts",
+    "build:extensions": "tsx script/build-extensions.ts",
+    "setup": "npm install --legacy-peer-deps && npm run setup:extensions -- --frozen-lockfile && cd extensions/web/web-ui && npm install",
+    "test": "npm run sync:extensions && npm run setup:extensions -- --frozen-lockfile && vitest run"
+  },
+  "dependencies": {
+    "@irises/extension-sdk": "file:packages/extension-sdk",
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "better-sqlite3": "^12.6.2",
+    "cli-highlight": "^2.1.11",
+    "croner": "^10.0.1",
+    "dereference-json-schema": "^0.2.2",
+    "jszip": "^3.10.1",
+    "mammoth": "^1.11.0",
+    "marked": "^17.0.4",
+    "mime-types": "^3.0.2",
+    "pdf-parse": "^2.4.5",
+    "sharp": "^0.34.5",
+    "tokenx": "^1.3.0",
+    "xlsx": "^0.18.5",
+    "yaml": "^2.8.2"
+  },
+  "optionalDependencies": {
+    "@opentui/core": "^0.1.88",
+    "@opentui/react": "latest",
+    "libreoffice-convert": "^1.8.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/mime-types": "^3.0.1",
+    "@types/node": "^22.19.15",
+    "tsx": "^4.21.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.2.4"
+  }
+}

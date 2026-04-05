@@ -1,0 +1,346 @@
+# ==========================================
+#  Iris 自动构建 & 发布
+#
+#  触发条件：
+#  1. push 以 v* 开头的 tag（如 v1.0.0）→ 自动构建 + 发布 Release + 发布 npm + 发布 Docker
+#  2. 手动触发 workflow_dispatch → 可独立勾选构建、发布 Release、发布 npm、发布 Docker
+#
+#  手动触发用法：
+#  - 什么都不勾：仅构建，产物保留 30 天供后续发布复用
+#  - 勾选 publish_release / publish_npm：构建后发布到对应渠道
+#  - 填写 build_run_id：跳过构建，直接复用指定 Run 的产物进行发布
+#
+#  构建方式：
+#  使用 bun build --compile 为每个平台编译独立二进制。
+#  产物包含主程序、onboard 配置引导、Web UI 静态资源和默认配置模板。
+#
+#  分发渠道：
+#  1. GitHub Release：解压即用的二进制 tar.gz / zip
+#  2. npm：irises 包装器包 + irises-* 平台二进制包
+#  3. Docker：ghcr.io/lianues/iris (production + computer-use)
+# ==========================================
+
+name: Build & Release
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: '发布到 GitHub Release'
+        type: boolean
+        default: false
+        required: false
+      publish_npm:
+        description: '发布到 npm'
+        type: boolean
+        default: false
+        required: false
+      version:
+        description: '版本号（发布 Release 时必填，如 v1.0.0）'
+        type: string
+        default: ''
+        required: false
+      build_run_id:
+        description: '复用已有构建的 Run ID（留空则重新构建）'
+        type: string
+        default: ''
+        required: false
+      publish_docker:
+        description: '发布 Docker 镜像到 GHCR'
+        type: boolean
+        default: false
+        required: false
+
+permissions:
+  contents: write
+  packages: write
+  actions: read
+
+jobs:
+  # ── 构建 ─────────────────────────────────
+  # 当提供了 build_run_id 时跳过，后续 job 直接从指定 Run 下载产物
+  build:
+    name: Build (${{ matrix.platform }}-${{ matrix.arch }})
+    if: ${{ !inputs.build_run_id && !(inputs.publish_docker && !inputs.publish_release && !inputs.publish_npm) }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - platform: linux
+            arch: x64
+            runner: ubuntu-latest
+          - platform: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - platform: darwin
+            arch: arm64
+            runner: macos-latest
+          - platform: darwin
+            arch: x64
+            runner: macos-latest
+            cross: true
+          - platform: windows
+            arch: x64
+            runner: windows-latest
+          - platform: windows
+            arch: arm64
+            runner: windows-latest
+            cross: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.2"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Install Web UI dependencies
+        working-directory: extensions/web/web-ui
+        run: npm ci
+
+      - name: Build Web UI
+        run: npm run build:ui
+
+      - name: Build binary (cross-compile)
+        if: matrix.cross == true
+        run: bun run build:compile -- --target ${{ matrix.platform }}-${{ matrix.arch }}
+
+      - name: Build binary (native)
+        if: matrix.cross != true
+        run: bun run build:compile -- --single
+
+      - name: Archive (Linux/macOS)
+        if: matrix.platform != 'windows'
+        run: |
+          cd dist/bin/iris-${{ matrix.platform }}-${{ matrix.arch }}
+          tar czf "$GITHUB_WORKSPACE/iris-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz" .
+          echo "Archive size: $(du -sh $GITHUB_WORKSPACE/iris-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz | cut -f1)"
+
+      - name: Archive (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "dist/bin/iris-windows-${{ matrix.arch }}\*" -DestinationPath "iris-windows-${{ matrix.arch }}.zip"
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: iris-${{ matrix.platform }}-${{ matrix.arch }}
+          path: |
+            iris-*.tar.gz
+            iris-*.zip
+          retention-days: 30
+
+      - name: Upload npm package artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: npm-iris-${{ matrix.platform }}-${{ matrix.arch }}
+          path: dist/bin/iris-${{ matrix.platform }}-${{ matrix.arch }}/
+          retention-days: 30
+
+  # ── 发布 GitHub Release ──────────────────
+  release:
+    name: Create GitHub Release
+    needs: [build]
+    if: >-
+      always() && !cancelled() &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped') &&
+      (startsWith(github.ref, 'refs/tags/v') || inputs.publish_release)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ inputs.version }}"
+            if [[ -z "$TAG" ]]; then
+              echo "::error::发布 Release 时必须填写版本号（如 v1.0.0）"
+              exit 1
+            fi
+            # 补全 v 前缀
+            if [[ "$TAG" != v* ]]; then
+              TAG="v${TAG}"
+            fi
+            echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+            echo "手动触发，使用版本号: ${TAG}"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+            echo "Tag 触发，使用: ${GITHUB_REF#refs/tags/}"
+          fi
+
+      - name: Create tag (manual dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "${{ steps.tag.outputs.tag }}" -m "Release ${{ steps.tag.outputs.tag }}"
+          git push origin "${{ steps.tag.outputs.tag }}"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: artifacts/
+          pattern: iris-*
+          merge-multiple: false
+          run-id: ${{ inputs.build_run_id || github.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release/
+          find artifacts/ -name '*.tar.gz' -o -name '*.zip' | while read f; do
+            cp "$f" release/
+          done
+          ls -lh release/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          body_path: RELEASE_NOTES.md
+          generate_release_notes: true
+          files: release/*
+
+  # ── 发布 npm ─────────────────────────────
+  publish-npm:
+    name: Publish to npm
+    needs: [build]
+    if: >-
+      always() && !cancelled() &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped') &&
+      (startsWith(github.ref, 'refs/tags/v') || inputs.publish_npm)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.2"
+
+      - name: Install extension SDK dependencies
+        working-directory: packages/extension-sdk
+        run: npm install
+
+      - name: Build extension SDK
+        working-directory: packages/extension-sdk
+        run: npm run build
+
+      - name: Publish extension SDK
+        working-directory: packages/extension-sdk
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Download npm package artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: dist/bin/
+          pattern: npm-iris-*
+          merge-multiple: false
+          run-id: ${{ inputs.build_run_id || github.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Flatten artifact directories
+        run: |
+          cd dist/bin
+          for d in npm-iris-*/; do
+            pkg_name=$(basename "$d" | sed 's/^npm-//')
+            if [ ! -d "$pkg_name" ]; then
+              mv "$d" "$pkg_name"
+            fi
+          done
+          rm -rf npm-iris-*
+          ls -la
+
+      - name: Publish
+        run: bun run script/publish.ts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # ── 发布 Docker 镜像到 GHCR ─────────────
+  # Docker 从源码独立构建，不依赖 binary build job，可并行运行
+  publish-docker:
+    name: Publish Docker images
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish_docker
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "tag=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+            TAG=$(node -p "require('./package.json').version")
+            echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Production image (Node 22 Debian slim)
+      - name: Build & push production image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          target: production
+          push: true
+          tags: |
+            ghcr.io/lianues/iris:latest
+            ghcr.io/lianues/iris:${{ steps.version.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Computer Use image (Ubuntu + Playwright)
+      - name: Build & push computer-use image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          target: computer-use-base
+          push: true
+          tags: |
+            ghcr.io/lianues/iris:computer-use
+            ghcr.io/lianues/iris:${{ steps.version.outputs.tag }}-computer-use
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
